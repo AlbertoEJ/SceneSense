@@ -1,0 +1,22 @@
+{
+  "name": "promo",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "generate-audio": "node src/audio/generateBgm.mjs",
+    "preview": "node src/audio/generateBgm.mjs && remotion studio src/index.js",
+    "render": "node src/audio/generateBgm.mjs && remotion render src/index.js SceneSensePromo out/promo.mp4"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@remotion/cli": "^4.0.428",
+    "@remotion/media-utils": "^4.0.428",
+    "@remotion/player": "^4.0.428",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "remotion": "^4.0.428"
+  }
+}
