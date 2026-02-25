@@ -5,8 +5,18 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+
+interface TokenCallback {
+    fun onToken(token: String)
+    fun onComplete(fullText: String)
+    fun onError(error: String)
+}
 
 class LlamaModel {
 
@@ -82,6 +92,85 @@ class LlamaModel {
         rawFrames.forEach { it.recycle() }
 
         runVideoInference(nativePtr, rgbArrays, widths, heights, prompt)
+    }
+
+    /** Single image inference — streaming, emits each token as it's generated */
+    fun describeImageStreaming(
+        bitmap: Bitmap,
+        prompt: String = "Describe this image."
+    ): Flow<String> = callbackFlow {
+        val scaled = scaleBitmap(bitmap, FRAME_MAX_DIM)
+        val rgbBytes = bitmapToRgb(scaled)
+
+        val callback = object : TokenCallback {
+            override fun onToken(token: String) {
+                trySend(token)
+            }
+            override fun onComplete(fullText: String) {
+                close()
+            }
+            override fun onError(error: String) {
+                close(IllegalStateException(error))
+            }
+        }
+
+        // Run native inference on IO thread — it blocks and calls callback per token
+        val job = kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+            try {
+                runInferenceStreaming(nativePtr, rgbBytes, scaled.width, scaled.height, prompt, callback)
+            } catch (e: Exception) {
+                close(e)
+            } finally {
+                if (scaled !== bitmap) scaled.recycle()
+            }
+        }
+
+        awaitClose { job.cancel() }
+    }
+
+    /** Video inference — streaming, emits each token as it's generated */
+    fun describeVideoStreaming(
+        videoUri: Uri,
+        retriever: MediaMetadataRetriever,
+        prompt: String = "What is the main action or notable event happening in this segment? Describe it in one brief sentence."
+    ): Flow<String> = callbackFlow {
+        val rawFrames = extractFrames(retriever)
+        if (rawFrames.isEmpty()) {
+            close(IllegalStateException("Could not extract frames from video"))
+            return@callbackFlow
+        }
+
+        val scaledFrames = rawFrames.map { scaleBitmap(it, FRAME_MAX_DIM) }
+        val widths = IntArray(scaledFrames.size) { scaledFrames[it].width }
+        val heights = IntArray(scaledFrames.size) { scaledFrames[it].height }
+        val rgbArrays = Array(scaledFrames.size) { bitmapToRgb(scaledFrames[it]) }
+
+        scaledFrames.forEach { scaled ->
+            if (scaled !in rawFrames) scaled.recycle()
+        }
+        rawFrames.forEach { it.recycle() }
+
+        val callback = object : TokenCallback {
+            override fun onToken(token: String) {
+                trySend(token)
+            }
+            override fun onComplete(fullText: String) {
+                close()
+            }
+            override fun onError(error: String) {
+                close(IllegalStateException(error))
+            }
+        }
+
+        val job = kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+            try {
+                runVideoInferenceStreaming(nativePtr, rgbArrays, widths, heights, prompt, callback)
+            } catch (e: Exception) {
+                close(e)
+            }
+        }
+
+        awaitClose { job.cancel() }
     }
 
     fun free() {
@@ -165,6 +254,18 @@ class LlamaModel {
         ctxPtr: Long, frames: Array<ByteArray>,
         widths: IntArray, heights: IntArray, prompt: String
     ): String
+
+    private external fun runInferenceStreaming(
+        ctxPtr: Long, imageBytes: ByteArray,
+        width: Int, height: Int, prompt: String,
+        callback: TokenCallback
+    )
+
+    private external fun runVideoInferenceStreaming(
+        ctxPtr: Long, frames: Array<ByteArray>,
+        widths: IntArray, heights: IntArray, prompt: String,
+        callback: TokenCallback
+    )
 
     private external fun freeModel(ctxPtr: Long)
 }

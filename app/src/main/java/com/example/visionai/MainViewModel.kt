@@ -22,6 +22,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.visionai.inference.LlamaModel
+import com.example.visionai.voice.VoiceCommand
+import com.example.visionai.voice.VoiceCommandParser
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
@@ -54,6 +56,10 @@ enum class CaptureMode {
     PHOTO, VIDEO, CONTINUOUS
 }
 
+enum class VoiceTriggerAction {
+    NONE, START_VIDEO, STOP_VIDEO
+}
+
 enum class AppLanguage { ENGLISH, SPANISH }
 
 enum class ChatRole { SYSTEM_DESCRIPTION, USER_QUESTION, ASSISTANT_ANSWER }
@@ -83,7 +89,11 @@ data class UiState(
     val ttsReady: Boolean = false,
     val isListening: Boolean = false,
     val showLanguageDialog: Boolean = false,
-    val language: AppLanguage = AppLanguage.ENGLISH
+    val language: AppLanguage = AppLanguage.ENGLISH,
+    val isVoiceCommandMode: Boolean = false,
+    val isVoiceListening: Boolean = false,
+    val lastVoiceCommand: String? = null,
+    val voiceTriggerAction: VoiceTriggerAction = VoiceTriggerAction.NONE
 )
 
 class MainViewModel(private val app: Application) : AndroidViewModel(app) {
@@ -99,6 +109,10 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     private var enToEsReady = false
     private var esEnReady = false
     private var continuousJob: Job? = null
+    private var voiceCommandRecognizer: SpeechRecognizer? = null
+    private var voiceFeedbackJob: Job? = null
+    private var registeredContext: Context? = null
+    private var registeredImageCapture: ImageCapture? = null
 
     init {
         val prefs = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -127,13 +141,34 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
                         _uiState.value = _uiState.value.copy(isSpeaking = true)
+                        // Pause voice command listening while TTS speaks
+                        if (_uiState.value.isVoiceCommandMode) {
+                            voiceCommandRecognizer?.stopListening()
+                        }
                     }
                     override fun onDone(utteranceId: String?) {
                         _uiState.value = _uiState.value.copy(isSpeaking = false)
+                        // Resume voice command listening after TTS finishes (with delay so mic doesn't catch echo)
+                        if (_uiState.value.isVoiceCommandMode) {
+                            viewModelScope.launch {
+                                delay(500)
+                                if (_uiState.value.isVoiceCommandMode && !_uiState.value.isSpeaking) {
+                                    restartVoiceCommandListening()
+                                }
+                            }
+                        }
                     }
                     @Deprecated("Deprecated in Java")
                     override fun onError(utteranceId: String?) {
                         _uiState.value = _uiState.value.copy(isSpeaking = false)
+                        if (_uiState.value.isVoiceCommandMode) {
+                            viewModelScope.launch {
+                                delay(500)
+                                if (_uiState.value.isVoiceCommandMode && !_uiState.value.isSpeaking) {
+                                    restartVoiceCommandListening()
+                                }
+                            }
+                        }
                     }
                 })
                 _uiState.value = _uiState.value.copy(ttsReady = true)
@@ -248,7 +283,20 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                     contextSize = 4096
                 )
 
-                // Ensure splash is visible for at least 2 seconds
+                // Warmup: run a tiny inference to initialize internal buffers
+                _uiState.value = _uiState.value.copy(
+                    statusText = "Calentando modelo...",
+                    downloadProgress = 0f,
+                    downloadLabel = ""
+                )
+                try {
+                    val warmupBitmap = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888)
+                    llamaModel.describeImage(warmupBitmap, prompt = "Hi")
+                } catch (_: Exception) {
+                    // Warmup failure is non-critical
+                }
+
+                // Ensure splash is visible for at least the minimum time
                 val elapsed = System.currentTimeMillis() - startTime
                 if (elapsed < MIN_SPLASH_MS) {
                     kotlinx.coroutines.delay(MIN_SPLASH_MS - elapsed)
@@ -312,7 +360,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         }
 
     companion object {
-        private const val MIN_SPLASH_MS = 2500L
+        private const val MIN_SPLASH_MS = 7000L
         private const val HF_BASE_URL =
             "https://huggingface.co/ggml-org/SmolVLM2-500M-Video-Instruct-GGUF/resolve/main/"
         private const val MODEL_FILENAME = "SmolVLM2-500M-Video-Instruct-Q8_0.gguf"
@@ -495,10 +543,12 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                     )
 
                     // Auto-speak the result for hands-free navigation
-                    tts?.let { engine ->
-                        val toSpeak = displayResponse.trim()
-                        if (toSpeak.isNotEmpty()) {
-                            engine.speak(toSpeak, TextToSpeech.QUEUE_FLUSH, null, "continuous_$count")
+                    val toSpeak = displayResponse.trim()
+                    if (toSpeak.isNotEmpty()) {
+                        if (_uiState.value.isVoiceCommandMode) {
+                            voiceAwareSpeak(toSpeak, "continuous_$count")
+                        } else {
+                            tts?.speak(toSpeak, TextToSpeech.QUEUE_FLUSH, null, "continuous_$count")
                         }
                     }
 
@@ -693,7 +743,35 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                 errorMessage = null
             )
             try {
-                val response = llamaModel.describeImage(bitmap)
+                val accumulated = StringBuilder()
+                var sentencesSpoken = 0
+
+                llamaModel.describeImageStreaming(bitmap).collect { token ->
+                    accumulated.append(token)
+                    if (!isSpanish) {
+                        _uiState.value = _uiState.value.copy(
+                            responseText = accumulated.toString()
+                        )
+                    }
+
+                    // Early TTS: speak complete sentences in voice command mode (English only)
+                    if (_uiState.value.isVoiceCommandMode && !isSpanish) {
+                        val text = accumulated.toString()
+                        val sentenceEnd = text.lastIndexOf('.').coerceAtLeast(
+                            text.lastIndexOf('!').coerceAtLeast(text.lastIndexOf('?'))
+                        )
+                        if (sentenceEnd > 0) {
+                            val completeSentences = text.substring(0, sentenceEnd + 1)
+                            val sentenceCount = completeSentences.count { it == '.' || it == '!' || it == '?' }
+                            if (sentenceCount > sentencesSpoken) {
+                                sentencesSpoken = sentenceCount
+                                voiceAwareSpeak(completeSentences, "voice_stream_$sentenceCount")
+                            }
+                        }
+                    }
+                }
+
+                val response = accumulated.toString()
                 val isContinuous = _uiState.value.captureMode == CaptureMode.CONTINUOUS
 
                 if (isSpanish) {
@@ -708,6 +786,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         qaCount = 0,
                         qaInputText = ""
                     )
+                    if (_uiState.value.isVoiceCommandMode) {
+                        voiceAwareSpeak(translated, "voice_describe")
+                    }
                 } else {
                     _uiState.value = _uiState.value.copy(
                         inferenceState = InferenceState.DONE,
@@ -719,6 +800,10 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         qaCount = 0,
                         qaInputText = ""
                     )
+                    // Speak full text at end (early TTS already spoke partial sentences)
+                    if (_uiState.value.isVoiceCommandMode && sentencesSpoken == 0) {
+                        voiceAwareSpeak(response, "voice_describe")
+                    }
                 }
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
@@ -742,8 +827,37 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             try {
                 val retriever = MediaMetadataRetriever()
                 retriever.setDataSource(app, uri)
-                val response = llamaModel.describeVideo(uri, retriever)
+
+                val accumulated = StringBuilder()
+                var sentencesSpoken = 0
+
+                llamaModel.describeVideoStreaming(uri, retriever).collect { token ->
+                    accumulated.append(token)
+                    if (!isSpanish) {
+                        _uiState.value = _uiState.value.copy(
+                            responseText = accumulated.toString()
+                        )
+                    }
+
+                    // Early TTS: speak complete sentences in voice command mode (English only)
+                    if (_uiState.value.isVoiceCommandMode && !isSpanish) {
+                        val text = accumulated.toString()
+                        val sentenceEnd = text.lastIndexOf('.').coerceAtLeast(
+                            text.lastIndexOf('!').coerceAtLeast(text.lastIndexOf('?'))
+                        )
+                        if (sentenceEnd > 0) {
+                            val completeSentences = text.substring(0, sentenceEnd + 1)
+                            val sentenceCount = completeSentences.count { it == '.' || it == '!' || it == '?' }
+                            if (sentenceCount > sentencesSpoken) {
+                                sentencesSpoken = sentenceCount
+                                voiceAwareSpeak(completeSentences, "voice_vstream_$sentenceCount")
+                            }
+                        }
+                    }
+                }
+
                 retriever.release()
+                val response = accumulated.toString()
 
                 if (isSpanish) {
                     val translated = translateEnToEs(response) ?: response
@@ -757,6 +871,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         qaCount = 0,
                         qaInputText = ""
                     )
+                    if (_uiState.value.isVoiceCommandMode) {
+                        voiceAwareSpeak(translated, "voice_describe_video")
+                    }
                 } else {
                     _uiState.value = _uiState.value.copy(
                         inferenceState = InferenceState.DONE,
@@ -768,6 +885,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         qaCount = 0,
                         qaInputText = ""
                     )
+                    if (_uiState.value.isVoiceCommandMode && sentencesSpoken == 0) {
+                        voiceAwareSpeak(response, "voice_describe_video")
+                    }
                 }
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
@@ -834,20 +954,48 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             val qaPrompt = buildQaPrompt(state.chatMessages, questionEn)
 
             try {
-                val response = if (state.selectedVideoUri != null) {
+                val accumulated = StringBuilder()
+                var sentencesSpoken = 0
+
+                val flow = if (state.selectedVideoUri != null) {
                     val retriever = MediaMetadataRetriever()
                     retriever.setDataSource(app, state.selectedVideoUri)
-                    val result = llamaModel.describeVideo(state.selectedVideoUri, retriever, prompt = qaPrompt)
-                    retriever.release()
-                    result
+                    llamaModel.describeVideoStreaming(state.selectedVideoUri, retriever, prompt = qaPrompt)
                 } else if (state.selectedBitmap != null) {
                     val bitmapCopy = state.selectedBitmap.copy(
                         state.selectedBitmap.config ?: Bitmap.Config.ARGB_8888, false
                     )
-                    llamaModel.describeImage(bitmapCopy, prompt = qaPrompt)
+                    llamaModel.describeImageStreaming(bitmapCopy, prompt = qaPrompt)
                 } else {
                     throw IllegalStateException("No image or video available")
                 }
+
+                flow.collect { token ->
+                    accumulated.append(token)
+                    if (!isSpanish) {
+                        _uiState.value = _uiState.value.copy(
+                            responseText = accumulated.toString()
+                        )
+                    }
+
+                    // Early TTS for English voice command mode
+                    if (_uiState.value.isVoiceCommandMode && !isSpanish) {
+                        val text = accumulated.toString()
+                        val sentenceEnd = text.lastIndexOf('.').coerceAtLeast(
+                            text.lastIndexOf('!').coerceAtLeast(text.lastIndexOf('?'))
+                        )
+                        if (sentenceEnd > 0) {
+                            val completeSentences = text.substring(0, sentenceEnd + 1)
+                            val sentenceCount = completeSentences.count { it == '.' || it == '!' || it == '?' }
+                            if (sentenceCount > sentencesSpoken) {
+                                sentencesSpoken = sentenceCount
+                                voiceAwareSpeak(completeSentences, "voice_qastream_$sentenceCount")
+                            }
+                        }
+                    }
+                }
+
+                val response = accumulated.toString()
 
                 val answerMessage = if (isSpanish) {
                     val translated = translateEnToEs(response) ?: response
@@ -863,6 +1011,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                     inferenceState = InferenceState.DONE,
                     responseText = displayText
                 )
+                if (_uiState.value.isVoiceCommandMode && sentencesSpoken == 0) {
+                    voiceAwareSpeak(displayText, "voice_qa")
+                }
             } catch (e: Exception) {
                 Log.e("VisionAI", "Q&A follow-up failed", e)
                 _uiState.value = _uiState.value.copy(
@@ -884,6 +1035,231 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             val updated = _uiState.value.chatMessages.toMutableList()
             updated[index] = msg.copy(translatedText = translated)
             _uiState.value = _uiState.value.copy(chatMessages = updated)
+        }
+    }
+
+    // ── Voice Command Mode ──────────────────────────────────────────
+
+    fun registerCaptureRefs(context: Context, imageCapture: ImageCapture?) {
+        registeredContext = context
+        registeredImageCapture = imageCapture
+    }
+
+    fun toggleVoiceCommandMode() {
+        val current = _uiState.value.isVoiceCommandMode
+        if (current) {
+            stopVoiceCommandListening()
+            _uiState.value = _uiState.value.copy(
+                isVoiceCommandMode = false,
+                isVoiceListening = false,
+                lastVoiceCommand = null
+            )
+        } else {
+            _uiState.value = _uiState.value.copy(isVoiceCommandMode = true)
+            startVoiceCommandListening()
+        }
+    }
+
+    private fun startVoiceCommandListening() {
+        if (!SpeechRecognizer.isRecognitionAvailable(app)) {
+            Log.e("VisionAI", "Speech recognition not available for voice commands")
+            return
+        }
+
+        voiceCommandRecognizer?.destroy()
+        voiceCommandRecognizer = SpeechRecognizer.createSpeechRecognizer(app).apply {
+            setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    _uiState.value = _uiState.value.copy(isVoiceListening = true)
+                }
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {
+                    _uiState.value = _uiState.value.copy(isVoiceListening = false)
+                }
+                override fun onError(error: Int) {
+                    _uiState.value = _uiState.value.copy(isVoiceListening = false)
+                    // Auto-restart on transient errors if still in voice mode
+                    if (_uiState.value.isVoiceCommandMode && !_uiState.value.isSpeaking) {
+                        if (error == SpeechRecognizer.ERROR_NO_MATCH ||
+                            error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                            restartVoiceCommandListening()
+                        } else {
+                            Log.e("VisionAI", "Voice command recognizer error: $error")
+                            // Retry with delay for other errors
+                            viewModelScope.launch {
+                                delay(1000)
+                                if (_uiState.value.isVoiceCommandMode) {
+                                    restartVoiceCommandListening()
+                                }
+                            }
+                        }
+                    }
+                }
+                override fun onResults(results: Bundle?) {
+                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val speech = matches?.firstOrNull() ?: ""
+                    _uiState.value = _uiState.value.copy(isVoiceListening = false)
+                    if (speech.isNotEmpty()) {
+                        handleVoiceCommand(speech)
+                    }
+                    // Auto-restart loop
+                    if (_uiState.value.isVoiceCommandMode && !_uiState.value.isSpeaking) {
+                        restartVoiceCommandListening()
+                    }
+                }
+                override fun onPartialResults(partialResults: Bundle?) {}
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+        }
+
+        launchVoiceRecognizerIntent()
+    }
+
+    private fun restartVoiceCommandListening() {
+        if (!_uiState.value.isVoiceCommandMode) return
+        viewModelScope.launch {
+            delay(300)
+            if (_uiState.value.isVoiceCommandMode && !_uiState.value.isSpeaking) {
+                launchVoiceRecognizerIntent()
+            }
+        }
+    }
+
+    private fun launchVoiceRecognizerIntent() {
+        // Never start listening while TTS is speaking
+        if (tts?.isSpeaking == true || _uiState.value.isSpeaking) return
+        val speechLang = if (_uiState.value.language == AppLanguage.SPANISH) "es-ES" else "en-US"
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, speechLang)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+        try {
+            voiceCommandRecognizer?.startListening(intent)
+        } catch (e: Exception) {
+            Log.e("VisionAI", "Failed to start voice command listening", e)
+        }
+    }
+
+    private fun stopVoiceCommandListening() {
+        voiceCommandRecognizer?.stopListening()
+        voiceCommandRecognizer?.destroy()
+        voiceCommandRecognizer = null
+        _uiState.value = _uiState.value.copy(isVoiceListening = false)
+    }
+
+    private fun handleVoiceCommand(speech: String) {
+        Log.i("VisionAI", "Voice command heard: $speech")
+        val state = _uiState.value
+
+        // If in Q&A mode and speech isn't a navigation command, treat as question
+        val command = VoiceCommandParser.parse(speech)
+        if (state.isQaMode && command == null) {
+            _uiState.value = state.copy(qaInputText = speech)
+            showVoiceCommandFeedback(speech)
+            askFollowUp()
+            return
+        }
+
+        if (command != null) {
+            showVoiceCommandFeedback(command.name.replace("_", " "))
+            executeVoiceCommand(command)
+        } else {
+            showVoiceCommandFeedback("\"$speech\" ?")
+        }
+    }
+
+    private fun executeVoiceCommand(command: VoiceCommand) {
+        Log.i("VisionAI", "Executing voice command: $command")
+        val state = _uiState.value
+        when (command) {
+            VoiceCommand.TAKE_PHOTO -> {
+                val ctx = registeredContext
+                val capture = registeredImageCapture
+                if (ctx == null || capture == null) {
+                    Log.e("VisionAI", "TAKE_PHOTO failed: context=$ctx, imageCapture=$capture")
+                    return
+                }
+                if (!llamaModel.isLoaded) {
+                    Log.e("VisionAI", "TAKE_PHOTO failed: model not loaded")
+                    return
+                }
+                viewModelScope.launch {
+                    try {
+                        val bitmap = captureFrame(ctx, capture)
+                        onPhotoCapturedAndDescribe(bitmap)
+                    } catch (e: Exception) {
+                        Log.e("VisionAI", "Voice TAKE_PHOTO failed", e)
+                    }
+                }
+            }
+            VoiceCommand.RECORD_VIDEO -> {
+                if (state.captureMode != CaptureMode.VIDEO) {
+                    setCaptureMode(CaptureMode.VIDEO)
+                }
+                if (!state.isRecording) {
+                    _uiState.value = _uiState.value.copy(voiceTriggerAction = VoiceTriggerAction.START_VIDEO)
+                }
+            }
+            VoiceCommand.STOP -> {
+                tts?.stop()
+                _uiState.value = _uiState.value.copy(isSpeaking = false)
+                if (state.isContinuousRunning) {
+                    stopContinuous()
+                }
+                if (state.isRecording) {
+                    _uiState.value = _uiState.value.copy(voiceTriggerAction = VoiceTriggerAction.STOP_VIDEO)
+                }
+            }
+            VoiceCommand.MODE_PHOTO -> setCaptureMode(CaptureMode.PHOTO)
+            VoiceCommand.MODE_VIDEO -> setCaptureMode(CaptureMode.VIDEO)
+            VoiceCommand.MODE_CONTINUOUS -> {
+                setCaptureMode(CaptureMode.CONTINUOUS)
+                val ctx = registeredContext
+                val capture = registeredImageCapture
+                if (ctx == null || capture == null) {
+                    Log.e("VisionAI", "MODE_CONTINUOUS: refs not registered ctx=$ctx capture=$capture")
+                    return
+                }
+                startContinuous(ctx, capture)
+            }
+            VoiceCommand.REPEAT -> {
+                val text = state.responseText.trim()
+                if (text.isNotEmpty()) {
+                    voiceAwareSpeak(text, "voice_repeat")
+                }
+            }
+            VoiceCommand.DESCRIBE -> {
+                describe()
+            }
+        }
+    }
+
+    /**
+     * Speak text while ensuring the voice command recognizer is stopped first.
+     * The UtteranceProgressListener.onDone will restart listening automatically.
+     */
+    private fun voiceAwareSpeak(text: String, utteranceId: String) {
+        if (text.isBlank()) return
+        // Stop recognizer BEFORE TTS starts to prevent it from hearing the output
+        voiceCommandRecognizer?.stopListening()
+        _uiState.value = _uiState.value.copy(isVoiceListening = false)
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+    }
+
+    fun clearVoiceTrigger() {
+        _uiState.value = _uiState.value.copy(voiceTriggerAction = VoiceTriggerAction.NONE)
+    }
+
+    private fun showVoiceCommandFeedback(text: String) {
+        voiceFeedbackJob?.cancel()
+        _uiState.value = _uiState.value.copy(lastVoiceCommand = text)
+        voiceFeedbackJob = viewModelScope.launch {
+            delay(1500)
+            _uiState.value = _uiState.value.copy(lastVoiceCommand = null)
         }
     }
 
@@ -912,9 +1288,14 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         _uiState.value = _uiState.value.copy(isContinuousRunning = false)
         speechRecognizer?.destroy()
         speechRecognizer = null
+        voiceCommandRecognizer?.destroy()
+        voiceCommandRecognizer = null
+        voiceFeedbackJob?.cancel()
         tts?.stop()
         tts?.shutdown()
         tts = null
+        registeredContext = null
+        registeredImageCapture = null
         updateBitmap(null)
         cleanupTempVideos()
         llamaModel.free()
