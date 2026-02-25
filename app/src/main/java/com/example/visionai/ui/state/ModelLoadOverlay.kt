@@ -32,8 +32,10 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.visionai.AppLanguage
 import com.example.visionai.ModelState
 import com.example.visionai.ui.theme.Cyan
 import com.example.visionai.ui.theme.DarkBg
@@ -45,6 +47,7 @@ fun ModelLoadOverlay(
     downloadProgress: Float,
     downloadLabel: String,
     statusText: String,
+    language: AppLanguage,
     onLoadModel: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -93,7 +96,22 @@ fun ModelLoadOverlay(
                 letterSpacing = 6.sp
             )
 
-            Spacer(modifier = Modifier.height(48.dp))
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // AI disclaimer
+            Text(
+                text = if (language == AppLanguage.SPANISH)
+                    "Las descripciones generadas por IA son aproximaciones que pueden contener errores, imprecisiones u omisiones. Los resultados no sustituyen el criterio humano ni constituyen información verificada. Tu privacidad está protegida: el procesamiento se realiza íntegramente en tu dispositivo."
+                else
+                    "AI-generated descriptions are approximations that may contain errors, inaccuracies, or omissions. Results do not replace human judgment and should not be considered verified information. Your privacy is protected: all processing is performed entirely on your device.",
+                color = Color.White.copy(alpha = 0.4f),
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                lineHeight = 16.sp,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.height(32.dp))
 
             when (modelState) {
                 ModelState.LOADING, ModelState.NOT_LOADED -> {
