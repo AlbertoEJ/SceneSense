@@ -1,6 +1,9 @@
 package com.example.visionai.ui.screen
 
 import android.Manifest
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.camera.core.ImageCapture
 import androidx.camera.video.Recorder
 import androidx.camera.video.Recording
@@ -51,17 +54,23 @@ import com.example.visionai.ui.overlay.HeaderOverlay
 import com.example.visionai.ui.overlay.ViewfinderOverlay
 import com.example.visionai.ui.sheet.ResponseBottomSheet
 import com.example.visionai.ui.state.ModelLoadOverlay
+import com.example.visionai.VoiceTriggerAction
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
-import com.google.accompanist.permissions.rememberPermissionState
+import com.google.accompanist.permissions.rememberMultiplePermissionsState
 
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
 fun MainScreen(viewModel: MainViewModel = viewModel()) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
-    val cameraPermission = rememberPermissionState(Manifest.permission.CAMERA)
-    val audioPermission = rememberPermissionState(Manifest.permission.RECORD_AUDIO)
+
+    val multiPermissions = rememberMultiplePermissionsState(
+        listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+    )
+    val cameraGranted = multiPermissions.permissions
+        .first { it.permission == Manifest.permission.CAMERA }
+        .status.isGranted
 
     var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
     var videoCapture by remember { mutableStateOf<VideoCapture<Recorder>?>(null) }
@@ -74,23 +83,57 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
         state.inferenceState == InferenceState.RUNNING ||
         (state.isQaMode && state.chatMessages.isNotEmpty())
 
-    // Auto-request camera permission when model is ready
-    LaunchedEffect(modelReady) {
-        if (modelReady && !cameraPermission.status.isGranted) {
-            cameraPermission.launchPermissionRequest()
+    // Request both permissions early (during splash)
+    LaunchedEffect(Unit) {
+        if (!multiPermissions.allPermissionsGranted) {
+            multiPermissions.launchMultiplePermissionRequest()
         }
     }
 
-    // Auto-start voice input after audio permission is granted
-    LaunchedEffect(audioPermission.status.isGranted) {
-        if (audioPermission.status.isGranted && state.isQaMode && !state.isListening) {
-            viewModel.toggleVoiceInput()
+    // Register capture refs so ViewModel can trigger captures by voice
+    LaunchedEffect(imageCapture) {
+        viewModel.registerCaptureRefs(context, imageCapture)
+    }
+
+    // Observe voiceTriggerAction to start/stop video recording from ViewModel
+    LaunchedEffect(state.voiceTriggerAction) {
+        when (state.voiceTriggerAction) {
+            VoiceTriggerAction.START_VIDEO -> {
+                viewModel.clearVoiceTrigger()
+                if (activeRecording == null) {
+                    VideoCaptureHandler.startRecording(
+                        context = context,
+                        videoCapture = videoCapture,
+                        onRecordingStarted = { recording ->
+                            activeRecording = recording
+                            viewModel.setRecording(true)
+                        },
+                        onRecordingFinished = { uri ->
+                            viewModel.setRecording(false)
+                            activeRecording = null
+                            viewModel.onVideoCapturedAndDescribe(uri)
+                        },
+                        onError = { _ ->
+                            viewModel.setRecording(false)
+                            activeRecording = null
+                        }
+                    )
+                }
+            }
+            VoiceTriggerAction.STOP_VIDEO -> {
+                viewModel.clearVoiceTrigger()
+                if (activeRecording != null) {
+                    VideoCaptureHandler.stopRecording(activeRecording)
+                    activeRecording = null
+                }
+            }
+            VoiceTriggerAction.NONE -> {}
         }
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         // Layer 1: Camera preview
-        if (cameraPermission.status.isGranted) {
+        if (cameraGranted) {
             CameraPreview(
                 onBound = { img, vid ->
                     imageCapture = img
@@ -122,6 +165,9 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                 isContinuousRunning = isContinuousRunning,
                 continuousCount = state.continuousCount,
                 enabled = modelReady && !isProcessing,
+                isVoiceCommandMode = state.isVoiceCommandMode,
+                isVoiceListening = state.isVoiceListening,
+                onToggleVoiceCommand = { viewModel.toggleVoiceCommandMode() },
                 onModeChange = { mode ->
                     viewModel.setCaptureMode(mode)
                 },
@@ -189,13 +235,7 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                 onQaInputChange = { viewModel.updateQaInput(it) },
                 onQaSend = { viewModel.askFollowUp() },
                 onTranslateMessage = { viewModel.translateMessage(it) },
-                onToggleVoice = {
-                    if (audioPermission.status.isGranted) {
-                        viewModel.toggleVoiceInput()
-                    } else {
-                        audioPermission.launchPermissionRequest()
-                    }
-                }
+                onToggleVoice = { viewModel.toggleVoiceInput() }
             )
         }
 
@@ -206,10 +246,32 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
             downloadProgress = state.downloadProgress,
             downloadLabel = state.downloadLabel,
             statusText = state.statusText,
+            language = state.language,
             onLoadModel = { viewModel.loadModel() }
         )
 
-        // Layer 6: Language selection dialog (first launch)
+        // Layer 6: Voice command feedback overlay
+        AnimatedVisibility(
+            visible = state.lastVoiceCommand != null,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = 100.dp)
+        ) {
+            GlassSurface(
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.padding(horizontal = 32.dp)
+            ) {
+                Text(
+                    text = state.lastVoiceCommand ?: "",
+                    color = NeonGreen,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
+                )
+            }
+        }
+
+        // Layer 7: Language selection dialog (first launch)
         if (state.showLanguageDialog) {
             LanguageSelectionDialog(
                 onSelectLanguage = { viewModel.setLanguage(it) }

@@ -6,12 +6,14 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -23,6 +25,7 @@ import androidx.compose.ui.unit.sp
 import com.example.visionai.CaptureMode
 import com.example.visionai.ui.components.CyberpunkButton
 import com.example.visionai.ui.components.ModeSelectorPill
+import com.example.visionai.ui.components.VoiceCommandButton
 import com.example.visionai.ui.theme.Cyan
 import com.example.visionai.ui.theme.ErrorRed
 
@@ -34,6 +37,9 @@ fun BottomControlsOverlay(
     isContinuousRunning: Boolean,
     continuousCount: Int,
     enabled: Boolean,
+    isVoiceCommandMode: Boolean = false,
+    isVoiceListening: Boolean = false,
+    onToggleVoiceCommand: () -> Unit = {},
     onModeChange: (CaptureMode) -> Unit,
     onShutterClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -55,12 +61,29 @@ fun BottomControlsOverlay(
                 enabled = !isContinuousRunning
             )
 
-            CyberpunkButton(
-                onClick = onShutterClick,
-                isRecording = isRecording,
-                isContinuousActive = isContinuousRunning,
-                enabled = enabled || isContinuousRunning
-            )
+            // Shutter row: VoiceCommandButton | Shutter | Spacer (for balance)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                VoiceCommandButton(
+                    isActive = isVoiceCommandMode,
+                    isListening = isVoiceListening,
+                    onClick = onToggleVoiceCommand
+                )
+
+                Spacer(modifier = Modifier.width(16.dp))
+
+                CyberpunkButton(
+                    onClick = onShutterClick,
+                    isRecording = isRecording,
+                    isContinuousActive = isContinuousRunning,
+                    enabled = enabled || isContinuousRunning
+                )
+
+                // Balance spacer (same width as VoiceCommandButton + gap)
+                Spacer(modifier = Modifier.width(64.dp))
+            }
 
             // Status label
             val statusText = when {
