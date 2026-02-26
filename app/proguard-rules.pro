@@ -6,6 +6,10 @@
 }
 -keep class com.example.visionai.inference.LlamaModel { *; }
 
+# Keep TokenCallback interface — JNI resolves onToken/onComplete/onError by name
+-keep interface com.example.visionai.inference.TokenCallback { *; }
+-keep class * implements com.example.visionai.inference.TokenCallback { *; }
+
 # Keep data classes used by StateFlow (prevent R8 from removing fields)
 -keep class com.example.visionai.UiState { *; }
 -keep class com.example.visionai.ChatMessage { *; }
