@@ -736,11 +736,18 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     private fun describePhoto(bitmap: Bitmap) {
         viewModelScope.launch {
             val isSpanish = _uiState.value.language == AppLanguage.SPANISH
+            val isContinuous = _uiState.value.captureMode == CaptureMode.CONTINUOUS
             _uiState.value = _uiState.value.copy(
                 inferenceState = InferenceState.RUNNING,
-                responseText = if (isSpanish) "Analizando imagen..." else "Analyzing image...",
+                responseText = if (isSpanish) "Analizando imagen..." else "",
                 translatedText = "",
-                errorMessage = null
+                errorMessage = null,
+                isQaMode = !isContinuous,
+                chatMessages = if (!isContinuous) listOf(
+                    ChatMessage(ChatRole.SYSTEM_DESCRIPTION, "")
+                ) else emptyList(),
+                qaCount = 0,
+                qaInputText = ""
             )
             try {
                 val accumulated = StringBuilder()
@@ -748,9 +755,13 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
                 llamaModel.describeImageStreaming(bitmap).collect { token ->
                     accumulated.append(token)
+                    val currentText = accumulated.toString()
                     if (!isSpanish) {
                         _uiState.value = _uiState.value.copy(
-                            responseText = accumulated.toString()
+                            responseText = currentText,
+                            chatMessages = if (!isContinuous) listOf(
+                                ChatMessage(ChatRole.SYSTEM_DESCRIPTION, currentText)
+                            ) else emptyList()
                         )
                     }
 
@@ -772,7 +783,6 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
 
                 val response = accumulated.toString()
-                val isContinuous = _uiState.value.captureMode == CaptureMode.CONTINUOUS
 
                 if (isSpanish) {
                     val translated = translateEnToEs(response) ?: response
@@ -781,10 +791,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         responseText = translated,
                         chatMessages = if (!isContinuous) listOf(
                             ChatMessage(ChatRole.SYSTEM_DESCRIPTION, response, translatedText = translated)
-                        ) else emptyList(),
-                        isQaMode = !isContinuous,
-                        qaCount = 0,
-                        qaInputText = ""
+                        ) else emptyList()
                     )
                     if (_uiState.value.isVoiceCommandMode) {
                         voiceAwareSpeak(translated, "voice_describe")
@@ -795,10 +802,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         responseText = response,
                         chatMessages = if (!isContinuous) listOf(
                             ChatMessage(ChatRole.SYSTEM_DESCRIPTION, response)
-                        ) else emptyList(),
-                        isQaMode = !isContinuous,
-                        qaCount = 0,
-                        qaInputText = ""
+                        ) else emptyList()
                     )
                     // Speak full text at end (early TTS already spoke partial sentences)
                     if (_uiState.value.isVoiceCommandMode && sentencesSpoken == 0) {
@@ -820,9 +824,15 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             val isSpanish = _uiState.value.language == AppLanguage.SPANISH
             _uiState.value = _uiState.value.copy(
                 inferenceState = InferenceState.RUNNING,
-                responseText = if (isSpanish) "Analizando video..." else "Analyzing video...",
+                responseText = if (isSpanish) "Analizando video..." else "",
                 translatedText = "",
-                errorMessage = null
+                errorMessage = null,
+                isQaMode = true,
+                chatMessages = listOf(
+                    ChatMessage(ChatRole.SYSTEM_DESCRIPTION, "")
+                ),
+                qaCount = 0,
+                qaInputText = ""
             )
             try {
                 val retriever = MediaMetadataRetriever()
@@ -833,9 +843,13 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
                 llamaModel.describeVideoStreaming(uri, retriever).collect { token ->
                     accumulated.append(token)
+                    val currentText = accumulated.toString()
                     if (!isSpanish) {
                         _uiState.value = _uiState.value.copy(
-                            responseText = accumulated.toString()
+                            responseText = currentText,
+                            chatMessages = listOf(
+                                ChatMessage(ChatRole.SYSTEM_DESCRIPTION, currentText)
+                            )
                         )
                     }
 
@@ -866,10 +880,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         responseText = translated,
                         chatMessages = listOf(
                             ChatMessage(ChatRole.SYSTEM_DESCRIPTION, response, translatedText = translated)
-                        ),
-                        isQaMode = true,
-                        qaCount = 0,
-                        qaInputText = ""
+                        )
                     )
                     if (_uiState.value.isVoiceCommandMode) {
                         voiceAwareSpeak(translated, "voice_describe_video")
@@ -880,10 +891,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         responseText = response,
                         chatMessages = listOf(
                             ChatMessage(ChatRole.SYSTEM_DESCRIPTION, response)
-                        ),
-                        isQaMode = true,
-                        qaCount = 0,
-                        qaInputText = ""
+                        )
                     )
                     if (_uiState.value.isVoiceCommandMode && sentencesSpoken == 0) {
                         voiceAwareSpeak(response, "voice_describe_video")

@@ -73,16 +73,19 @@ fun ChatContent(
 ) {
     val listState = rememberLazyListState()
 
-    LaunchedEffect(chatMessages.size) {
+    // Scroll to bottom when new messages arrive or streaming text updates
+    val lastMessageText = chatMessages.lastOrNull()?.text ?: ""
+    LaunchedEffect(chatMessages.size, lastMessageText) {
         if (chatMessages.isNotEmpty()) {
             listState.animateScrollToItem(chatMessages.size - 1)
         }
     }
 
     Column(modifier = modifier.padding(16.dp)) {
-        QaCounterBadge(qaCount = qaCount, isSpanishMode = isSpanishMode)
-
-        Spacer(modifier = Modifier.height(12.dp))
+        if (inferenceState != InferenceState.RUNNING) {
+            QaCounterBadge(qaCount = qaCount, isSpanishMode = isSpanishMode)
+            Spacer(modifier = Modifier.height(12.dp))
+        }
 
         LazyColumn(
             state = listState,
@@ -94,39 +97,43 @@ fun ChatContent(
             itemsIndexed(chatMessages) { index, message ->
                 ChatBubble(
                     message = message,
-                    ttsReady = ttsReady,
+                    ttsReady = ttsReady && inferenceState != InferenceState.RUNNING,
                     isSpanishMode = isSpanishMode,
                     onTranslate = { onTranslateMessage(index) },
                     onSpeak = { onSpeakMessage(index) }
                 )
             }
 
-            if (inferenceState == InferenceState.RUNNING) {
+            // Show thinking indicator only before first token arrives
+            val lastMessageEmpty = chatMessages.lastOrNull()?.text?.isEmpty() == true
+            if (inferenceState == InferenceState.RUNNING && lastMessageEmpty) {
                 item { ThinkingIndicator(isSpanishMode = isSpanishMode) }
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        if (inferenceState != InferenceState.RUNNING) {
+            Spacer(modifier = Modifier.height(12.dp))
 
-        if (qaCount >= 3) {
-            Text(
-                text = if (isSpanishMode) "L\u00CDMITE DE PREGUNTAS ALCANZADO" else "QUESTION LIMIT REACHED",
-                color = Cyan.copy(alpha = 0.5f),
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 1.5.sp,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
-            )
-        } else {
-            QaInputRow(
-                text = qaInputText,
-                enabled = inferenceState != InferenceState.RUNNING,
-                isListening = isListening,
-                isSpanishMode = isSpanishMode,
-                onTextChange = onInputChange,
-                onSend = onSend,
-                onToggleVoice = onToggleVoice
-            )
+            if (qaCount >= 3) {
+                Text(
+                    text = if (isSpanishMode) "L\u00CDMITE DE PREGUNTAS ALCANZADO" else "QUESTION LIMIT REACHED",
+                    color = Cyan.copy(alpha = 0.5f),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.5.sp,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                )
+            } else {
+                QaInputRow(
+                    text = qaInputText,
+                    enabled = true,
+                    isListening = isListening,
+                    isSpanishMode = isSpanishMode,
+                    onTextChange = onInputChange,
+                    onSend = onSend,
+                    onToggleVoice = onToggleVoice
+                )
+            }
         }
 
         PoweredByFooter()
