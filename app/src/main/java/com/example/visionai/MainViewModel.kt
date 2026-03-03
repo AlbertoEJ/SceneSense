@@ -552,8 +552,19 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         }
                     }
 
-                    // Pause so user hears the result before next frame
-                    delay(3000)
+                    // Wait for TTS to finish before capturing next frame
+                    val ttsTimeout = 30_000L // max wait 30s
+                    val startWait = System.currentTimeMillis()
+                    while (_uiState.value.isSpeaking &&
+                        System.currentTimeMillis() - startWait < ttsTimeout &&
+                        _uiState.value.isContinuousRunning
+                    ) {
+                        delay(200)
+                    }
+                    // Small pause after TTS finishes for natural pacing
+                    if (_uiState.value.isContinuousRunning) {
+                        delay(500)
+                    }
                 }
             } catch (e: Exception) {
                 Log.e("VisionAI", "Continuous mode error at frame $count", e)
